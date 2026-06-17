@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MMD to glTF Exporter",
-    "author": "Custom Addon / revised by M365 Copilot / fixed v2.6.9",
-    "version": (2, 6, 9),
+    "author": "Custom Addon / revised by M365 Copilot",
+    "version": (2, 3, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > MMD Exporter",
     "description": "mmd_toolsで読み込んだMMDモデルをglTF/GLBに変換してエクスポートします",
@@ -1041,13 +1041,13 @@ classes = [
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    print("MMD to glTF Exporter v2.6.9: 有効化されました")
+    print("MMD to glTF Exporter v2.3.0: 有効化されました")
 
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    print("MMD to glTF Exporter v2.6.9: 無効化されました")
+    print("MMD to glTF Exporter v2.3.0: 無効化されました")
 
 
 if __name__ == "__main__":
