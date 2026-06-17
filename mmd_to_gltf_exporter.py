@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MMD to glTF Exporter",
     "author": "Custom Addon / revised by M365 Copilot",
-    "version": (2, 3, 0),
+    "version": (2, 5, 4),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > MMD Exporter",
     "description": "mmd_toolsで読み込んだMMDモデルをglTF/GLBに変換してエクスポートします",
@@ -10,13 +10,18 @@ bl_info = {
 
 import os
 import bpy
-from bpy.props import StringProperty, BoolProperty, EnumProperty
+from bpy.props import StringProperty, BoolProperty, EnumProperty, FloatProperty
 from bpy.types import Operator, Panel
 from bpy_extras.io_utils import ExportHelper
 
 _BLENDER_VERSION = bpy.app.version
 
 IMAGE_CACHE = {}
+
+# ambient（環境色）をBase Colorに加算する際の既定の強さ（0.0〜1.0）。
+# 0 では加算なし（素直なテクスチャ色）。眉などをMMD寄りに明るくしたい場合のみ
+# Step1のスライダーで上げる。上げすぎると全体が白っぽくなる。
+AMBIENT_STRENGTH = 0.0
 
 
 # ============================================================
@@ -38,15 +43,34 @@ def _safe_abspath(filepath):
         return filepath
 
 
-def _set_blend_mode(mat, use_alpha):
+def _set_blend_mode(mat, use_alpha, clip=False):
+    """
+    マテリアルの透過モードを設定する。
+    use_alpha=False: 不透明（OPAQUE）
+    use_alpha=True, clip=True : アルファクリップ（二値透過。眉毛など）
+    use_alpha=True, clip=False: 半透明ブレンド（レンズなど）
+
+    クリップは点描状に透けないので、透過テクスチャ（眉毛・まつ毛）に適する。
+    glTFエクスポート時、クリップは alphaMode:MASK、ブレンドは BLEND になる。
+    """
     try:
         if _BLENDER_VERSION < (4, 2, 0):
-            mat.blend_method = "HASHED" if use_alpha else "OPAQUE"
+            if not use_alpha:
+                mat.blend_method = "OPAQUE"
+            elif clip:
+                mat.blend_method = "CLIP"
+            else:
+                mat.blend_method = "BLEND"
             if hasattr(mat, "shadow_method"):
-                mat.shadow_method = "HASHED" if use_alpha else "OPAQUE"
+                mat.shadow_method = "CLIP" if use_alpha else "OPAQUE"
         else:
             if hasattr(mat, "surface_render_method"):
-                mat.surface_render_method = "DITHERED" if use_alpha else "OPAQUE"
+                # 4.2+ は DITHERED か BLENDED。クリップ的な二値透過は
+                # DITHERED を使い、glTF側で alphaMode を MASK にするため
+                # 後段で alpha_clip しきい値を設定する。
+                mat.surface_render_method = "BLENDED" if (use_alpha and not clip) else (
+                    "DITHERED" if use_alpha else "OPAQUE"
+                )
     except Exception as e:
         print(f"[MMD Exporter] blend mode設定に失敗: {mat.name} / {e}")
 
@@ -250,6 +274,40 @@ def _is_pale_base_image(image, threshold=0.75):
     return result
 
 
+_ALPHA_CACHE = {}
+
+
+def _texture_has_transparency(image, threshold=0.5):
+    """
+    テクスチャのアルファチャンネルに実際の透明部分があるかを判定する。
+    眉毛・まつ毛など、マテリアルのalphaが1.0でもテクスチャ自体で
+    透過しているケースを検出するために使う。
+
+    アルファの最小値が threshold 未満なら「透明部分あり」と判定。
+    結果は画像名でキャッシュする。
+    """
+    if image is None:
+        return False
+
+    key = image.name
+    if key in _ALPHA_CACHE:
+        return _ALPHA_CACHE[key]
+
+    result = False
+    try:
+        if image.has_data and getattr(image, "channels", 0) == 4 and len(image.pixels) >= 4:
+            import numpy as np
+
+            px = np.array(image.pixels[:], dtype=np.float32)
+            alpha = px.reshape(-1, 4)[:, 3]
+            result = float(alpha.min()) < threshold
+    except Exception:
+        result = False
+
+    _ALPHA_CACHE[key] = result
+    return result
+
+
 def _extract_images_from_nodes(mat):
     """
     nodes.clear() する前に、既存のノードツリーから画像オブジェクトを取得する。
@@ -359,7 +417,14 @@ def _extract_mmd_material_info(mat):
     texture_path = ""
     sphere_path = ""
     sphere_texture_type = "0"
-    is_double_sided = True
+    # v2.5.5 と同じく、デフォルトは False（片面）にする。
+    # True にすると、属性が読めなかった際に本来片面のマテリアルが
+    # 両面になり、環境によって裏返り・描画競合を起こすため。
+    is_double_sided = False
+    # ambient（環境色）。MMDは「テクスチャ×diffuse + ambient」で色を合成する。
+    # この ambient 加算が、黒い眉などを明るく持ち上げて金色に見せている。
+    # デフォルトは黒（加算なし）。
+    ambient = (0.0, 0.0, 0.0)
 
     mmd_mat = getattr(mat, "mmd_material", None)
 
@@ -372,6 +437,12 @@ def _extract_mmd_material_info(mat):
         if hasattr(mmd_mat, "alpha"):
             alpha = float(mmd_mat.alpha)
             diffuse = (diffuse[0], diffuse[1], diffuse[2], alpha)
+
+        # ambient_color を取得
+        if hasattr(mmd_mat, "ambient_color"):
+            ac = mmd_mat.ambient_color
+            if len(ac) >= 3:
+                ambient = (ac[0], ac[1], ac[2])
 
         for attr in ("texture", "texture_filepath", "texture_path"):
             if hasattr(mmd_mat, attr):
@@ -395,15 +466,22 @@ def _extract_mmd_material_info(mat):
         if hasattr(mmd_mat, "sphere_texture_type"):
             sphere_texture_type = str(getattr(mmd_mat, "sphere_texture_type", "0"))
 
+        # is_double_sided を取得。mmd_material から読めればそれを使う。
+        got_double = False
         for attr in ("is_double_sided", "double_sided"):
             if hasattr(mmd_mat, attr):
                 try:
                     is_double_sided = bool(getattr(mmd_mat, attr))
+                    got_double = True
                     break
                 except Exception:
                     pass
+        # 読めなかった場合は、現在のマテリアルの backface culling から逆算
+        # （v2.5.5 のフォールバックを踏襲）
+        if not got_double:
+            is_double_sided = not getattr(mat, "use_backface_culling", True)
 
-    return diffuse, alpha, texture_path, sphere_path, sphere_texture_type, is_double_sided
+    return diffuse, alpha, texture_path, sphere_path, sphere_texture_type, is_double_sided, ambient
 
 
 # ============================================================
@@ -415,25 +493,30 @@ def _build_principled_material(
     image=None,
     diffuse=(1.0, 1.0, 1.0, 1.0),
     alpha=1.0,
-    is_double_sided=True,
+    is_double_sided=False,
     sph_image=None,
     apply_sphere=False,
+    force_double_sided=False,
+    ambient=(0.0, 0.0, 0.0),
+    ambient_strength=AMBIENT_STRENGTH,
 ):
     mat.use_nodes = True
     mat.diffuse_color = (diffuse[0], diffuse[1], diffuse[2], alpha)
-    mat.use_backface_culling = not is_double_sided
+    # force_double_sided が True の場合、MMD側の設定に関わらず両面表示にする。
+    # MMDは両面描画前提のため、法線が反転した片面ポリゴンの透け・裏返りを
+    # これで回避できる（glTFには doubleSided フラグとして出力される）。
+    if force_double_sided:
+        mat.use_backface_culling = False
+    else:
+        mat.use_backface_culling = not is_double_sided
 
-    # テクスチャにアルファチャンネルがあるか、またはアルファ値が半透明なら透過設定
-    # channels==4 を優先し、取得できない場合は depth でフォールバック判定する
-    tex_has_alpha = False
-    if image is not None:
-        channels = getattr(image, "channels", None)
-        if channels is not None:
-            tex_has_alpha = channels == 4
-        else:
-            tex_has_alpha = getattr(image, "depth", 0) in (32, 128)
-    use_alpha = tex_has_alpha or alpha < 0.999
-    _set_blend_mode(mat, use_alpha)
+    # 透過の判定（v2.5.5 と同じシンプルな挙動）:
+    # マテリアルのアルファ値が1未満のときだけ半透明にする。
+    # 眉毛・まつ毛などは肌テクスチャに色として直接描き込まれており、
+    # テクスチャのアルファチャンネルで透過させる必要はない。
+    # テクスチャのアルファを使うと、肌全体が透けるなどの誤動作になるため使わない。
+    use_alpha = alpha < 0.999
+    _set_blend_mode(mat, use_alpha, clip=False)
 
     tree = mat.node_tree
     tree.nodes.clear()
@@ -452,12 +535,13 @@ def _build_principled_material(
     metallic_socket = _get_principled_socket(bsdf, ["Metallic"])
 
     if base_color_socket:
-        base_color_socket.default_value = (
-            diffuse[0],
-            diffuse[1],
-            diffuse[2],
-            alpha,
-        )
+        # 単色（テクスチャなし）の場合の基準色。
+        # MMDの「diffuse + ambient」に倣い、ambientは控えめ係数をかけて加算し
+        # 0〜1 にクランプする。テクスチャがある場合は後段で上書きされる。
+        br = min(1.0, diffuse[0] + ambient[0] * ambient_strength)
+        bg = min(1.0, diffuse[1] + ambient[1] * ambient_strength)
+        bb = min(1.0, diffuse[2] + ambient[2] * ambient_strength)
+        base_color_socket.default_value = (br, bg, bb, alpha)
 
     if alpha_socket:
         alpha_socket.default_value = alpha
@@ -481,17 +565,14 @@ def _build_principled_material(
         except Exception:
             pass
 
-        # スフィアマップ（乗算）を適用する場合。
-        # MMDのスフィアは「カメラ空間での法線の向き」を 0〜1 のUVに
-        # マッピングしてサンプリングする。TexCoordのNormalをそのまま
-        # Vectorに繋ぐとサンプリング位置がずれて色が濁るため、
-        # Vector Transform でカメラ空間に変換し、(N*0.5+0.5) でUV化する。
+        # テクスチャ（またはスフィア合成後）の色源ソケットを color_source に保持し、
+        # 最後に ambient を加算してから Base Color に繋ぐ。
+        color_source = tex.outputs.get("Color")
+
         if sph_image and apply_sphere:
             sph = tree.nodes.new(type="ShaderNodeTexImage")
             sph.location = (-300, -200)
             sph.image = sph_image
-            # スフィアは色情報ではなく反射の強度的に使われるが、
-            # MMDの実装に合わせ sRGB のまま扱う
             try:
                 sph.image.colorspace_settings.name = "sRGB"
             except Exception:
@@ -500,7 +581,6 @@ def _build_principled_material(
             geom = tree.nodes.new(type="ShaderNodeNewGeometry")
             geom.location = (-1100, -250)
 
-            # 法線をカメラ（ビュー）空間へ変換
             vec_xform = tree.nodes.new(type="ShaderNodeVectorTransform")
             vec_xform.location = (-900, -250)
             vec_xform.vector_type = "NORMAL"
@@ -508,7 +588,6 @@ def _build_principled_material(
             vec_xform.convert_to = "CAMERA"
             _link_if_possible(tree, geom.outputs.get("Normal"), vec_xform.inputs.get("Vector"))
 
-            # (N * 0.5 + 0.5) でUV座標(0〜1)に変換
             mad = tree.nodes.new(type="ShaderNodeVectorMath")
             mad.location = (-700, -250)
             mad.operation = "MULTIPLY_ADD"
@@ -523,32 +602,46 @@ def _build_principled_material(
                 mix.data_type = "RGBA"
                 mix.factor_mode = "UNIFORM"
                 mix.blend_type = "MULTIPLY"
-
                 if "Factor" in mix.inputs:
                     mix.inputs["Factor"].default_value = 1.0
-
                 _link_if_possible(tree, tex.outputs.get("Color"), mix.inputs.get("A"))
                 _link_if_possible(tree, sph.outputs.get("Color"), mix.inputs.get("B"))
-                _link_if_possible(tree, mix.outputs.get("Result"), base_color_socket)
-
+                color_source = mix.outputs.get("Result")
             except Exception:
-                # Blender 4.1以前: ShaderNodeMixRGB を使う
                 mix = tree.nodes.new(type="ShaderNodeMixRGB")
                 mix.location = (-50, 50)
                 mix.blend_type = "MULTIPLY"
                 mix.inputs[0].default_value = 1.0
-
                 _link_if_possible(tree, tex.outputs.get("Color"), mix.inputs[1])
                 _link_if_possible(tree, sph.outputs.get("Color"), mix.inputs[2])
-                _link_if_possible(tree, mix.outputs.get("Color"), base_color_socket)
+                color_source = mix.outputs.get("Color")
 
+        # ── ambient（環境色）を加算 ──
+        # MMDは「テクスチャ×diffuse + ambient」で色を合成する。
+        # ambient が黒(0,0,0)でなければ、加算ノードを挟んで色を持ち上げる。
+        # これにより黒い眉などが ambient 分だけ明るく（金色っぽく）なる。
+        if ambient and max(ambient) > 0.001 and ambient_strength > 0.001:
+            add = tree.nodes.new(type="ShaderNodeMixRGB")
+            add.location = (60, 200)
+            add.blend_type = "ADD"
+            add.inputs[0].default_value = 1.0
+            ar = ambient[0] * ambient_strength
+            ag = ambient[1] * ambient_strength
+            ab = ambient[2] * ambient_strength
+            try:
+                add.inputs[2].default_value = (ar, ag, ab, 1.0)
+            except Exception:
+                add.inputs[2].default_value = (ar, ag, ab)
+            _link_if_possible(tree, color_source, add.inputs[1])
+            _link_if_possible(tree, add.outputs.get("Color"), base_color_socket)
         else:
-            _link_if_possible(tree, tex.outputs.get("Color"), base_color_socket)
+            _link_if_possible(tree, color_source, base_color_socket)
 
-        # テクスチャにアルファチャンネルがある場合のみアルファをリンク
-        # （リンクした後に default_value を上書きしない）
-        if tex_has_alpha and alpha_socket:
-            _link_if_possible(tree, tex.outputs.get("Alpha"), alpha_socket)
+        # テクスチャのアルファは Alpha ソケットにリンクしない。
+        # 半透明（alpha<1.0）の制御は、後段で設定する Alpha ソケットの
+        # default_value（マテリアルのalpha値）だけで行う。
+        # テクスチャのアルファを繋ぐと、肌テクスチャの透明部分などで
+        # 顔・肌全体が透ける誤動作になるため。
 
 
 # ============================================================
@@ -625,10 +718,30 @@ class MMD_OT_ConvertMaterials(Operator):
         default="NONE",
     )
 
+    force_double_sided: BoolProperty(
+        name="全マテリアルを両面表示",
+        description="MMD側の設定に関わらず全マテリアルを両面表示にする。"
+                    "通常はオフ（MMDの元設定を尊重）。法線が直らず透ける場合のみオン",
+        default=False,
+    )
+
+    ambient_strength: FloatProperty(
+        name="環境色（明るさ）の強さ",
+        description="MMDのambientをBase Colorに加算する強さ。"
+                    "上げると眉などが明るく（金色寄り）になるが、上げすぎると全体が白っぽくなる。"
+                    "通常は0（素直なテクスチャ色）。眉などをMMD寄りにしたい場合のみ上げる",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        step=1,        # スライダーのステップ（0.01単位）
+        precision=2,
+    )
+
     def execute(self, context):
         by_basename = _build_image_cache()
         search_dirs = _get_model_search_dirs()
         _PALE_CACHE.clear()
+        _ALPHA_CACHE.clear()
 
         converted = 0
         skipped = 0
@@ -643,7 +756,7 @@ class MMD_OT_ConvertMaterials(Operator):
             # nodes.clear() される前に既存ノードから画像を取得（最優先）
             node_image, node_sphere = _extract_images_from_nodes(mat)
 
-            diffuse, alpha, texture_path, sphere_path, sphere_texture_type, is_double_sided = (
+            diffuse, alpha, texture_path, sphere_path, sphere_texture_type, is_double_sided, ambient = (
                 _extract_mmd_material_info(mat)
             )
 
@@ -694,6 +807,9 @@ class MMD_OT_ConvertMaterials(Operator):
                 is_double_sided=is_double_sided,
                 sph_image=sph_image,
                 apply_sphere=apply_sphere,
+                force_double_sided=self.force_double_sided,
+                ambient=ambient,
+                ambient_strength=self.ambient_strength,
             )
 
             converted += 1
@@ -825,18 +941,18 @@ class MMD_OT_RenameBones(Operator):
 # Step 3: GLBエクスポート
 # ============================================================
 
-# export_apply を True にするとアーマチュアモディファイアが二重適用され
-# スキンウェイトが崩れる既知の問題があるため False にする。
-# モデファイアを適用したい場合は手動で適用してからエクスポートすること。
+# export_apply を True にするとエクスポート時にトランスフォーム（回転・スケール）と
+# モディファイアが適用され、面の向きが正しく出力される（裏返り防止）。
+# MMDモデルは未適用の回転・スケールを持つことが多く、False だと裏返りが起きるため
+# True をデフォルトとする。スキン変形に問題が出る場合のみ、エクスポート時の
+# オプションで False に切り替えられる。
 _GLTF_EXPORT_PARAMS = {
     "export_format": "GLB",
     "use_visible": True,
-    "use_selection": False,
-    "export_apply": False,   # ← True から False に変更（スキン崩れ防止）
+    "export_apply": True,   # トランスフォーム適用（裏返り防止）
     "export_yup": True,
     "export_texcoords": True,
     "export_normals": True,
-    "export_tangents": True,
     "export_materials": "EXPORT",
     "export_colors": True,
     "export_skins": True,
@@ -845,7 +961,7 @@ _GLTF_EXPORT_PARAMS = {
 _GLTF_EXPORT_PARAMS_FALLBACK = {
     "export_format": "GLB",
     "use_visible": True,
-    "export_apply": False,
+    "export_apply": True,
     "export_yup": True,
     "export_materials": "EXPORT",
     "export_skins": True,
@@ -878,10 +994,18 @@ class MMD_OT_ExportGLTF(Operator, ExportHelper):
         default=False,
     )
 
+    apply_transforms: BoolProperty(
+        name="トランスフォーム/モディファイアを適用",
+        description="エクスポート時に回転・スケール・モディファイアを適用する。"
+                    "面の裏返りを防ぐため通常はオン。スキン変形に問題が出る場合はオフにする",
+        default=True,
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "export_animations")
         layout.prop(self, "export_morphs")
+        layout.prop(self, "apply_transforms")
         layout.prop(self, "convert_materials_before_export")
 
     def execute(self, context):
@@ -904,6 +1028,7 @@ class MMD_OT_ExportGLTF(Operator, ExportHelper):
             params["filepath"] = filepath
             params["export_morph"] = self.export_morphs
             params["export_animations"] = self.export_animations
+            params["export_apply"] = self.apply_transforms
 
             try:
                 bpy.ops.export_scene.gltf(**params)
@@ -914,6 +1039,7 @@ class MMD_OT_ExportGLTF(Operator, ExportHelper):
                 fallback_params["filepath"] = filepath
                 fallback_params["export_morph"] = self.export_morphs
                 fallback_params["export_animations"] = self.export_animations
+                fallback_params["export_apply"] = self.apply_transforms
                 bpy.ops.export_scene.gltf(**fallback_params)
 
         except Exception as e:
@@ -928,12 +1054,15 @@ class MMD_OT_ExportGLTF(Operator, ExportHelper):
         return {"FINISHED"}
 
 
-def _run_convert_materials(by_basename, search_dirs, sphere_mode="NONE"):
+def _run_convert_materials(by_basename, search_dirs, sphere_mode="NONE",
+                           force_double_sided=False,
+                           ambient_strength=AMBIENT_STRENGTH):
     """
     bpy.ops を経由せずマテリアル変換を直接実行する内部関数。
     エクスポートダイアログのコンテキスト問題を回避するために使用。
     """
     _PALE_CACHE.clear()
+    _ALPHA_CACHE.clear()
 
     for mat in bpy.data.materials:
         if not _is_mmd_material(mat):
@@ -941,7 +1070,7 @@ def _run_convert_materials(by_basename, search_dirs, sphere_mode="NONE"):
 
         node_image, node_sphere = _extract_images_from_nodes(mat)
 
-        diffuse, alpha, texture_path, sphere_path, sphere_texture_type, is_double_sided = (
+        diffuse, alpha, texture_path, sphere_path, sphere_texture_type, is_double_sided, ambient = (
             _extract_mmd_material_info(mat)
         )
 
@@ -984,6 +1113,9 @@ def _run_convert_materials(by_basename, search_dirs, sphere_mode="NONE"):
             is_double_sided=is_double_sided,
             sph_image=sph_image,
             apply_sphere=apply_sphere,
+            force_double_sided=force_double_sided,
+            ambient=ambient,
+            ambient_strength=ambient_strength,
         )
 
 
@@ -1041,13 +1173,13 @@ classes = [
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    print("MMD to glTF Exporter v2.3.0: 有効化されました")
+    print("MMD to glTF Exporter v2.5.4: 有効化されました")
 
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    print("MMD to glTF Exporter v2.3.0: 無効化されました")
+    print("MMD to glTF Exporter v2.5.4: 無効化されました")
 
 
 if __name__ == "__main__":
