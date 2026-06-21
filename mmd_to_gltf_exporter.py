@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "MMD to glTF Exporter",
+    "name": "MMD Exporter",
     "author": "Custom Addon / revised by M365 Copilot",
-    "version": (2, 5, 4),
+    "version": (2, 6, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > MMD Exporter",
-    "description": "mmd_toolsで読み込んだMMDモデルをglTF/GLBに変換してエクスポートします",
+    "description": "mmd_toolsで読み込んだMMDモデルをglTF/GLB または FBX に変換してエクスポートします（Unity / Unreal Engine向け）",
     "category": "Import-Export",
 }
 
@@ -1054,6 +1054,172 @@ class MMD_OT_ExportGLTF(Operator, ExportHelper):
         return {"FINISHED"}
 
 
+# ============================================================
+# Step 3: FBXエクスポート
+# ============================================================
+
+# Unity / Unreal Engine 向けの既定パラメータ。
+#   add_leaf_bones=False        : 末端に余計なボーンを足さない（Unity/UEでボーンが増えるのを防ぐ）
+#   mesh_smooth_type="FACE"     : Unityが扱いやすいスムージング情報の持たせ方
+#   use_armature_deform_only=False : MMDのIK等の非変形ボーンも残す（必要ならTrueで削減）
+#   bake_anim_use_all_bones=True : UE向けに全ボーンへ最低1キーを打つ
+#   path_mode="COPY" + embed_textures=True : テクスチャをFBXに埋め込み単一ファイル化
+#
+# 注意: FBXには glTF の export_apply に相当する単一オプションが無い。
+#   - モディファイア適用 → use_mesh_modifiers
+#   - 回転/スケールのベイク → bake_space_transform（アーマチュア/アニメを壊すことがあるため既定False）
+#
+# 【重要】use_mesh_modifiers は既定 False。
+# Blenderはシェイプキー（=MMDモーフ。まばたき・口パク等）を持つメッシュに
+# モディファイアを適用できないため、これをTrueにするとエクスポート時にモーフが
+# 落ちる。FBXは座標軸（axis_forward/axis_up）で向きを処理でき、モディファイア
+# 適用に頼らなくても裏返らないことを確認済みのため、モーフ保持を優先して
+# 既定 False とする（生成系モディファイアを焼き込みたい場合のみTrueにする。その場合モーフは失われるので注意）。
+_FBX_EXPORT_PARAMS = {
+    "use_visible": True,
+    "object_types": {"ARMATURE", "MESH", "EMPTY"},
+    "apply_unit_scale": True,
+    "apply_scale_options": "FBX_SCALE_NONE",
+    "bake_space_transform": False,
+    "use_mesh_modifiers": True,
+    "mesh_smooth_type": "FACE",
+    "add_leaf_bones": False,
+    "primary_bone_axis": "Y",
+    "secondary_bone_axis": "X",
+    "use_armature_deform_only": False,
+    "bake_anim": True,
+    "bake_anim_use_all_bones": True,
+    "bake_anim_use_nla_strips": False,
+    "bake_anim_use_all_actions": False,
+    "bake_anim_force_startend_keying": True,
+    "bake_anim_simplify_factor": 1.0,
+    "path_mode": "COPY",
+    "embed_textures": True,
+    "axis_forward": "-Z",
+    "axis_up": "Y",
+}
+
+# 古いBlenderで一部引数が未対応の場合に使う最小セット。
+_FBX_EXPORT_PARAMS_FALLBACK = {
+    "use_visible": True,
+    "object_types": {"ARMATURE", "MESH", "EMPTY"},
+    "apply_unit_scale": True,
+    "use_mesh_modifiers": True,
+    "mesh_smooth_type": "FACE",
+    "add_leaf_bones": False,
+    "bake_anim": True,
+    "path_mode": "COPY",
+    "embed_textures": True,
+}
+
+
+class MMD_OT_ExportFBX(Operator, ExportHelper):
+    bl_idname = "mmd.export_fbx"
+    bl_label = "FBXとしてエクスポート"
+    bl_description = "Unity / Unreal Engine向けにFBXファイルを書き出します"
+
+    filename_ext = ".fbx"
+    filter_glob: StringProperty(
+        default="*.fbx",
+        options={"HIDDEN"},
+    )
+
+    export_animations: BoolProperty(
+        name="アニメーションを出力",
+        default=True,
+    )
+
+    apply_modifiers: BoolProperty(
+        name="モディファイアを適用",
+        description="エクスポート時に（アーマチュア以外の）モディファイアを適用する。"
+                    "オンにするとシェイプキー（=MMDモーフ：まばたき・口パク等）が"
+                    "失われるため、モーフを残すには【オフのまま】にする。"
+                    "生成系モディファイアを焼き込みたい場合のみオン",
+        default=False,
+    )
+
+    embed_textures: BoolProperty(
+        name="テクスチャを埋め込む",
+        description="テクスチャをFBXファイル内に埋め込み単一ファイルにする。"
+                    "オフにすると別ファイルとして書き出される",
+        default=True,
+    )
+
+    bake_space_transform: BoolProperty(
+        name="座標変換をベイク（実験的）",
+        description="オブジェクトの回転・スケールをメッシュに焼き込む。"
+                    "向きが直らず裏返る場合のみオン。"
+                    "アーマチュアやアニメに影響することがあるため通常はオフ",
+        default=False,
+    )
+
+    convert_materials_before_export: BoolProperty(
+        name="出力前にマテリアル変換",
+        description="MMDマテリアルをPrincipled BSDFへ変換してから出力する。"
+                    "FBXにはベースカラーテクスチャと両面/透過設定が引き継がれる"
+                    "（スフィアマップ・環境色のノードはFBXには出力されない）",
+        default=False,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "export_animations")
+        layout.prop(self, "apply_modifiers")
+        layout.prop(self, "embed_textures")
+        layout.prop(self, "bake_space_transform")
+        layout.prop(self, "convert_materials_before_export")
+        layout.label(text="※モーフを残すには「モディファイアを適用」をオフのままに", icon="INFO")
+
+    def execute(self, context):
+        filepath = self.filepath
+        if not filepath.lower().endswith(".fbx"):
+            filepath += ".fbx"
+
+        # マテリアル変換はエクスポートダイアログが閉じた後（execute内）で
+        # 呼ぶ必要があるため、ここで直接関数を呼ぶ（bpy.ops経由ではなく）
+        if self.convert_materials_before_export:
+            by_basename = _build_image_cache()
+            search_dirs = _get_model_search_dirs()
+            _run_convert_materials(by_basename, search_dirs)
+
+        # glTFと共通の前処理（内部オブジェクト非表示・SDEFシェイプキーのミュート）
+        hidden_states = _hide_mmd_internal_objects()
+        muted_states = _mute_sdef_shape_keys()
+
+        try:
+            params = dict(_FBX_EXPORT_PARAMS)
+            params["filepath"] = filepath
+            params["bake_anim"] = self.export_animations
+            params["use_mesh_modifiers"] = self.apply_modifiers
+            params["embed_textures"] = self.embed_textures
+            params["path_mode"] = "COPY" if self.embed_textures else "AUTO"
+            params["bake_space_transform"] = self.bake_space_transform
+
+            try:
+                bpy.ops.export_scene.fbx(**params)
+
+            except TypeError:
+                # Blenderのバージョン差で一部引数が未対応の場合のフォールバック
+                fallback_params = dict(_FBX_EXPORT_PARAMS_FALLBACK)
+                fallback_params["filepath"] = filepath
+                fallback_params["bake_anim"] = self.export_animations
+                fallback_params["use_mesh_modifiers"] = self.apply_modifiers
+                fallback_params["embed_textures"] = self.embed_textures
+                fallback_params["path_mode"] = "COPY" if self.embed_textures else "AUTO"
+                bpy.ops.export_scene.fbx(**fallback_params)
+
+        except Exception as e:
+            self.report({"ERROR"}, f"FBXエクスポート失敗: {e}")
+            return {"CANCELLED"}
+
+        finally:
+            _restore_sdef_shape_keys(muted_states)
+            _restore_hidden_objects(hidden_states)
+
+        self.report({"INFO"}, f"FBXエクスポート完了: {filepath}")
+        return {"FINISHED"}
+
+
 def _run_convert_materials(by_basename, search_dirs, sphere_mode="NONE",
                            force_double_sided=False,
                            ambient_strength=AMBIENT_STRENGTH):
@@ -1124,7 +1290,7 @@ def _run_convert_materials(by_basename, search_dirs, sphere_mode="NONE",
 # ============================================================
 
 class MMD_PT_ExporterPanel(Panel):
-    bl_label = "MMD → glTF Exporter"
+    bl_label = "MMD Exporter"
     bl_idname = "MMD_PT_exporter"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -1151,9 +1317,15 @@ class MMD_PT_ExporterPanel(Panel):
 
         col.separator()
 
-        col.label(text="Step 3")
+        col.label(text="Step 3: エクスポート")
         col.operator(
             "mmd.export_gltf",
+            text="GLB（glTF）で出力",
+            icon="EXPORT",
+        )
+        col.operator(
+            "mmd.export_fbx",
+            text="FBXで出力",
             icon="EXPORT",
         )
 
@@ -1166,6 +1338,7 @@ classes = [
     MMD_OT_ConvertMaterials,
     MMD_OT_RenameBones,
     MMD_OT_ExportGLTF,
+    MMD_OT_ExportFBX,
     MMD_PT_ExporterPanel,
 ]
 
@@ -1173,13 +1346,13 @@ classes = [
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    print("MMD to glTF Exporter v2.5.4: 有効化されました")
+    print("MMD Exporter v2.6.1: 有効化されました")
 
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    print("MMD to glTF Exporter v2.5.4: 無効化されました")
+    print("MMD Exporter v2.6.1: 無効化されました")
 
 
 if __name__ == "__main__":
