@@ -1,29 +1,64 @@
+# MMD Exporter
 
-MMD to glTF Exporter
-Blender アドオン — mmd_tools で読み込んだ MMD モデルを glTF (GLB) 形式に変換・エクスポートします。
-機能
-ステップ	内容
-Step 1	MMD シェーダー → Principled BSDF へマテリアル変換
-Step 2	日本語ボーン名 → 英語名に変換（Unity / UE 対応）
-Step 3	GLB としてエクスポート（非表示オブジェクト除外）
-動作環境
-Blender 4.2 以上（3.x 系でも動作しますが非推奨）
-mmd_tools がインストールされていること
-インストール
-右上の Code → Download ZIP でこのリポジトリをダウンロード
-Blender を起動 → 編集 → プリファレンス → アドオン → インストール
-ダウンロードした ZIP 内の `mmd\_to\_gltf\_exporter.py` を選択
-アドオン一覧で 「MMD to glTF Exporter」 を有効化
-使い方
-mmd_tools で MMD モデル（.pmx）を読み込む
-`3D ビューポート > サイドバー (N キー) > MMD Exporter` タブを開く
-Step 1 → Step 2 → Step 3 の順にボタンを押す
-変更履歴
-v2.5.5（最新）
-Windows パス正規化を改善（バックスラッシュ統一）
-画像キャッシュを一括構築する仕組みに変更（処理速度向上）
-SDEF シェイプキーを一時ミュートしてエクスポート時の破綻を防止
-mmd_tools 内部オブジェクト（`.dummy\_armature` 等）を自動非表示化
-Blender 4.2 (EEVEE Next) のアルファ設定に対応
-ライセンス
-MIT License — 詳細は LICENSE を参照してください。
+Blender アドオン — `mmd_tools` で読み込んだ MMD モデルを **glTF (GLB)** または **FBX** 形式に変換・エクスポートします（Unity / Unreal Engine 向け）。
+
+> 旧称「MMD to glTF Exporter」。リポジトリ名とファイル名は互換性のため `mmd-to-gltf-exporter` / `mmd_to_gltf_exporter.py` のままですが、アドオンの表示名は **MMD Exporter** です。
+
+## 機能
+
+| ステップ | 内容 |
+| --- | --- |
+| Step 1 | MMD シェーダー → Principled BSDF へマテリアル変換 |
+| Step 2 | 日本語ボーン名 → 英語名に変換（Unity / UE 対応） |
+| Step 3 | **GLB（glTF）** または **FBX** としてエクスポート（非表示オブジェクト除外） |
+
+## glTF と FBX の使い分け
+
+モデルの用途に応じて、後工程が少なくなるほうを選べます。
+
+| 観点 | glTF / GLB | FBX |
+| --- | --- | --- |
+| マテリアルの忠実度 | ◎ 変換ロジックがそのまま活きる | △ エンジン側で組み直す前提 |
+| モーフ（まばたき・口パク） | △ ジオメトリ補正と両立しにくい | ◎ ジオメトリ正常のまま保持できる |
+| Unity Humanoid / アニメ連携 | △ | ◎ |
+| 取り込みプラグイン | 要（glTFast 等） | 不要（ネイティブ） |
+
+ざっくりした目安：**見た目重視の静止用途なら glTF**、**動かすキャラ（表情モーフ・アニメ）なら FBX**。
+
+## 動作環境
+
+- Blender 4.2 以上（3.x 系でも動作しますが非推奨）
+- `mmd_tools` がインストールされていること
+
+## インストール
+
+1. 右上の **Code → Download ZIP** でこのリポジトリをダウンロード
+2. Blender を起動 → **編集 → プリファレンス → アドオン → インストール**
+3. ダウンロードした ZIP 内の `mmd_to_gltf_exporter.py` を選択（単体の `.py` を直接インストールしても可）
+4. アドオン一覧で **「MMD Exporter」** を有効化
+
+## 使い方
+
+1. `mmd_tools` で MMD モデル（.pmx）を読み込む
+2. `3D ビューポート > サイドバー (N キー) > MMD Exporter` タブを開く
+3. **Step 1 → Step 2 → Step 3** の順にボタンを押す
+4. Step 3 で **「GLB（glTF）で出力」** か **「FBXで出力」** を選ぶ
+
+## FBX に関する注意
+
+- **モーフを残すには、FBX出力ダイアログの「モディファイアを適用」をオフのまま**にしてください（v2.6.1 から既定オフ）。Blender はシェイプキーを持つメッシュにモディファイアを適用できないため、オンにするとモーフ（まばたき・口パク等）が失われます。FBX は座標軸で向きを処理するため、適用なしでもジオメトリは裏返りません。
+- 表情モーフ（シェイプキー）は FBX のブレンドシェイプとして出力されます。
+- 動作確認状況：**Unity = 確認済み（良好）**／**Unreal Engine 5 = 確認中**。
+
+## 既知の制限
+
+- スフィアマップ（金属の反射光沢など）に依存したマテリアルは、glTF / FBX いずれもそのままでは再現されません。例：チョーカーの金具が黒くなる場合があります。その場合は該当マテリアルの Principled BSDF で Base Color を金属色に、Metallic = 1.0、Roughness を低めに手動設定してください。
+- 環境色（ambient）由来の色味は、MMD の非物理シェーダーを Principled BSDF へ変換する都合上、完全には一致しません。
+
+## 変更履歴
+
+最新は **v2.6.1**（FBX出力対応・モーフ保持）。詳細は [CHANGELOG.md](CHANGELOG.md) を参照してください。
+
+## ライセンス
+
+MIT License — 詳細は [LICENSE](LICENSE) を参照してください。
