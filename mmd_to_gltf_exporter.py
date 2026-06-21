@@ -1,6 +1,6 @@
 bl_info = {
     "name": "MMD Exporter",
-    "author": "Custom Addon / revised by M365 Copilot",
+    "author": "Custom Addon ",
     "version": (2, 6, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > MMD Exporter",
