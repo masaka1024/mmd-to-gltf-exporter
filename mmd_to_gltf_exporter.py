@@ -1081,7 +1081,7 @@ _FBX_EXPORT_PARAMS = {
     "apply_unit_scale": True,
     "apply_scale_options": "FBX_SCALE_NONE",
     "bake_space_transform": False,
-    "use_mesh_modifiers": True,
+    "use_mesh_modifiers": False,
     "mesh_smooth_type": "FACE",
     "add_leaf_bones": False,
     "primary_bone_axis": "Y",
