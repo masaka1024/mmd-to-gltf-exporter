@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MMD Exporter",
     "author": "Custom Addon ",
-    "version": (2, 6, 1),
+    "version": (2, 6, 6),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > MMD Exporter",
     "description": "mmd_toolsで読み込んだMMDモデルをglTF/GLB または FBX に変換してエクスポートします（Unity / Unreal Engine向け）",
@@ -18,10 +18,13 @@ _BLENDER_VERSION = bpy.app.version
 
 IMAGE_CACHE = {}
 
-# ambient（環境色）をBase Colorに加算する際の既定の強さ（0.0〜1.0）。
-# 0 では加算なし（素直なテクスチャ色）。眉などをMMD寄りに明るくしたい場合のみ
-# Step1のスライダーで上げる。上げすぎると全体が白っぽくなる。
-AMBIENT_STRENGTH = 0.0
+# MMD式の色合成「テクスチャ × clamp(diffuse×0.6 + ambient)」の適用度（0.0〜1.0）。
+# 0.6 はMMD既定ライト 154/255 ≒ 0.604 の近似（mmd_toolsも同等の式を採用）。
+# 1.0 でMMDの見た目に忠実:
+#   - diffuseが黒でambientに色があるマテリアルが真っ黒になる問題を解消
+#   - 「加算」ではなく「乗算の係数」なので、明るいテクスチャが白飛びしない
+# 0.0 にすると従来動作（テクスチャ素通し／単色はdiffuseのみ）。比較・検証用。
+AMBIENT_STRENGTH = 1.0
 
 
 # ============================================================
@@ -64,13 +67,16 @@ def _set_blend_mode(mat, use_alpha, clip=False):
             if hasattr(mat, "shadow_method"):
                 mat.shadow_method = "CLIP" if use_alpha else "OPAQUE"
         else:
-            if hasattr(mat, "surface_render_method"):
-                # 4.2+ は DITHERED か BLENDED。クリップ的な二値透過は
-                # DITHERED を使い、glTF側で alphaMode を MASK にするため
-                # 後段で alpha_clip しきい値を設定する。
-                mat.surface_render_method = "BLENDED" if (use_alpha and not clip) else (
-                    "DITHERED" if use_alpha else "OPAQUE"
-                )
+            # 【v2.6.4で修正】Blender 4.2+(EEVEE Next)の surface_render_method
+            # には "OPAQUE" という列挙値が存在せず、"DITHERED" か "BLENDED" の
+            # 2択しかない。不透明時に "OPAQUE" を代入しようとして全マテリアルで
+            # 例外が発生していた(実害は透過設定が更新されないだけで色は無事)。
+            # 不透明の場合はそもそも surface_render_method を変更する必要が
+            # ないため、use_alpha=True の時だけ設定するよう修正。
+            if use_alpha and hasattr(mat, "surface_render_method"):
+                # クリップ的な二値透過は DITHERED を使い、glTF側で alphaMode を
+                # MASK にするため後段で alpha_clip しきい値を設定する。
+                mat.surface_render_method = "BLENDED" if not clip else "DITHERED"
     except Exception as e:
         print(f"[MMD Exporter] blend mode設定に失敗: {mat.name} / {e}")
 
@@ -499,6 +505,7 @@ def _build_principled_material(
     force_double_sided=False,
     ambient=(0.0, 0.0, 0.0),
     ambient_strength=AMBIENT_STRENGTH,
+    use_texture_alpha=True,
 ):
     mat.use_nodes = True
     mat.diffuse_color = (diffuse[0], diffuse[1], diffuse[2], alpha)
@@ -510,13 +517,48 @@ def _build_principled_material(
     else:
         mat.use_backface_culling = not is_double_sided
 
-    # 透過の判定（v2.5.5 と同じシンプルな挙動）:
-    # マテリアルのアルファ値が1未満のときだけ半透明にする。
-    # 眉毛・まつ毛などは肌テクスチャに色として直接描き込まれており、
-    # テクスチャのアルファチャンネルで透過させる必要はない。
-    # テクスチャのアルファを使うと、肌全体が透けるなどの誤動作になるため使わない。
+    # 透過の判定:
+    # マテリアルのアルファ値が1未満のときは半透明にする（レンズ等）。
+    # 【v2.6.4で修正】以前は「テクスチャのアルファは一切使わない」方針だったが、
+    # これだと眉毛のように「地肌の上に半透明で重ね描きされた」テクスチャが、
+    # 変換前(mmd_shader)では透けて見えていたのに、変換後は不透明な黒として
+    # 描画されてしまう不具合があった。
+    # 対策として、テクスチャに実際にアルファの濃淡がある場合のみ
+    # （肌など普通に不透明な画像は影響を受けない）、テクスチャのアルファを
+    # Alphaソケットに接続して透過を再現する。
     use_alpha = alpha < 0.999
-    _set_blend_mode(mat, use_alpha, clip=False)
+    texture_alpha_applies = (
+        use_texture_alpha
+        and image is not None
+        and not use_alpha
+        and _texture_has_transparency(image)
+    )
+    if texture_alpha_applies:
+        use_alpha = True
+    # 【v2.6.5で修正】テクスチャの透過には「クリップ(二値抜き)」を使う。
+    # 髪や眉のように半透明の板が何枚も重なる構造では、「ブレンド」方式は
+    # 描画順(奥→手前)に強く依存し、順序が合わないとレイヤーの奥側が
+    # 変な位置に透けて見える・裏返って見えるなどの破綻を起こす。
+    # クリップはピクセル単位で透明/不透明を二値で決めるため描画順に
+    # 依存せず、この種の破綻が原理的に起きない。
+    _set_blend_mode(mat, use_alpha, clip=texture_alpha_applies)
+
+    # ── MMD式の合成色（tint）を計算 ──
+    # MMDの画面上の色はおおよそ「テクスチャ × clamp(diffuse + ambient)」。
+    # 【v2.6.3で修正】以前は diffuse に 0.6 を掛けていたが、これだと
+    # diffuse=白/ambient=黒という最も一般的な組み合わせ(色はテクスチャ任せ)
+    # でも tint=0.6 になり、テクスチャ全体を無条件に40%暗くしてしまっていた。
+    # 肌などの明るい色は気づきにくいが、元々暗い眉・瞳孔・輪郭線などが
+    # 真っ黒に潰れて見える原因になっていた。
+    # diffuse の係数を 1.0 にすることで、diffuse=白/ambient=黒 の場合は
+    # tint=1.0（変化なし）となり従来通りの見た目を保ちつつ、
+    # diffuse=黒/ambient=色付き（本来の真っ黒バグ）は tint=ambient色 に
+    # なり正しく救済される。
+    # ambient_strength は本式の適用度: 1.0=MMD式に忠実 / 0.0=従来動作。
+    s = max(0.0, min(1.0, ambient_strength))
+    mmd_tint = tuple(
+        min(1.0, diffuse[i] + ambient[i]) for i in range(3)
+    )
 
     tree = mat.node_tree
     tree.nodes.clear()
@@ -535,13 +577,26 @@ def _build_principled_material(
     metallic_socket = _get_principled_socket(bsdf, ["Metallic"])
 
     if base_color_socket:
-        # 単色（テクスチャなし）の場合の基準色。
-        # MMDの「diffuse + ambient」に倣い、ambientは控えめ係数をかけて加算し
-        # 0〜1 にクランプする。テクスチャがある場合は後段で上書きされる。
-        br = min(1.0, diffuse[0] + ambient[0] * ambient_strength)
-        bg = min(1.0, diffuse[1] + ambient[1] * ambient_strength)
-        bb = min(1.0, diffuse[2] + ambient[2] * ambient_strength)
+        # 単色（テクスチャなし）: 従来のdiffuseとMMD式tintを s でブレンド。
+        # s=1.0 なら diffuseが黒くても ambient の色がそのまま出る。
+        # テクスチャがある場合は後段で上書きされる。
+        br = diffuse[0] * (1.0 - s) + mmd_tint[0] * s
+        bg = diffuse[1] * (1.0 - s) + mmd_tint[1] * s
+        bb = diffuse[2] * (1.0 - s) + mmd_tint[2] * s
         base_color_socket.default_value = (br, bg, bb, alpha)
+
+    # 【v2.6.6で追加】スフィア専用フォールバック:
+    # 「銀」「髪止め」などMMDの金属系マテリアルは、diffuse/ambientをほぼ黒に
+    # したまま、見た目の色や光沢をスフィアマップ(反射テクスチャ)だけに
+    # 依存させる作り方がよくある。ベーステクスチャが無く、かつ計算した単色も
+    # ほぼ黒の場合、色の情報源が実質存在しないため真っ黒になってしまう。
+    # スフィアマップが存在するなら、sphere_modeの設定に関わらずそれを使う
+    # (真っ黒になるよりは、多少MMDと完全一致しなくても色が出る方を優先)。
+    sphere_fallback_active = (
+        image is None
+        and sph_image is not None
+        and max(br, bg, bb) < 0.12
+    )
 
     if alpha_socket:
         alpha_socket.default_value = alpha
@@ -552,24 +607,28 @@ def _build_principled_material(
     if metallic_socket:
         metallic_socket.default_value = 0.0
 
-    if image:
-        tex = tree.nodes.new(type="ShaderNodeTexImage")
-        tex.location = (-500, 100)
-        tex.image = image
+    if image or sphere_fallback_active:
+        tex = None
+        color_source = None
 
-        # ベースカラー用テクスチャは sRGB であるべき。
-        # Non-Color や Linear になっていると色が暗く・濁って見える。
-        try:
-            if image.colorspace_settings.name not in ("sRGB", "Filmic sRGB"):
-                image.colorspace_settings.name = "sRGB"
-        except Exception:
-            pass
+        if image:
+            tex = tree.nodes.new(type="ShaderNodeTexImage")
+            tex.location = (-500, 100)
+            tex.image = image
 
-        # テクスチャ（またはスフィア合成後）の色源ソケットを color_source に保持し、
-        # 最後に ambient を加算してから Base Color に繋ぐ。
-        color_source = tex.outputs.get("Color")
+            # ベースカラー用テクスチャは sRGB であるべき。
+            # Non-Color や Linear になっていると色が暗く・濁って見える。
+            try:
+                if image.colorspace_settings.name not in ("sRGB", "Filmic sRGB"):
+                    image.colorspace_settings.name = "sRGB"
+            except Exception:
+                pass
 
-        if sph_image and apply_sphere:
+            # テクスチャ（またはスフィア合成後）の色源ソケットを color_source に保持し、
+            # 最後に MMD式tint を乗算してから Base Color に繋ぐ。
+            color_source = tex.outputs.get("Color")
+
+        if sph_image and (apply_sphere or sphere_fallback_active):
             sph = tree.nodes.new(type="ShaderNodeTexImage")
             sph.location = (-300, -200)
             sph.image = sph_image
@@ -596,52 +655,74 @@ def _build_principled_material(
             _link_if_possible(tree, vec_xform.outputs.get("Vector"), mad.inputs[0])
             _link_if_possible(tree, mad.outputs.get("Vector"), sph.inputs.get("Vector"))
 
-            try:
-                mix = tree.nodes.new(type="ShaderNodeMix")
-                mix.location = (-50, 50)
-                mix.data_type = "RGBA"
-                mix.factor_mode = "UNIFORM"
-                mix.blend_type = "MULTIPLY"
-                if "Factor" in mix.inputs:
-                    mix.inputs["Factor"].default_value = 1.0
-                _link_if_possible(tree, tex.outputs.get("Color"), mix.inputs.get("A"))
-                _link_if_possible(tree, sph.outputs.get("Color"), mix.inputs.get("B"))
-                color_source = mix.outputs.get("Result")
-            except Exception:
-                mix = tree.nodes.new(type="ShaderNodeMixRGB")
-                mix.location = (-50, 50)
-                mix.blend_type = "MULTIPLY"
-                mix.inputs[0].default_value = 1.0
-                _link_if_possible(tree, tex.outputs.get("Color"), mix.inputs[1])
-                _link_if_possible(tree, sph.outputs.get("Color"), mix.inputs[2])
-                color_source = mix.outputs.get("Color")
+            if tex is not None:
+                try:
+                    mix = tree.nodes.new(type="ShaderNodeMix")
+                    mix.location = (-50, 50)
+                    mix.data_type = "RGBA"
+                    mix.factor_mode = "UNIFORM"
+                    mix.blend_type = "MULTIPLY"
+                    if "Factor" in mix.inputs:
+                        mix.inputs["Factor"].default_value = 1.0
+                    _link_if_possible(tree, tex.outputs.get("Color"), mix.inputs.get("A"))
+                    _link_if_possible(tree, sph.outputs.get("Color"), mix.inputs.get("B"))
+                    color_source = mix.outputs.get("Result")
+                except Exception:
+                    mix = tree.nodes.new(type="ShaderNodeMixRGB")
+                    mix.location = (-50, 50)
+                    mix.blend_type = "MULTIPLY"
+                    mix.inputs[0].default_value = 1.0
+                    _link_if_possible(tree, tex.outputs.get("Color"), mix.inputs[1])
+                    _link_if_possible(tree, sph.outputs.get("Color"), mix.inputs[2])
+                    color_source = mix.outputs.get("Color")
+            else:
+                # ベーステクスチャが無い(スフィア専用フォールバック)場合は、
+                # 掛け合わせる相手が無いのでスフィアの色をそのまま使う。
+                color_source = sph.outputs.get("Color")
 
-        # ── ambient（環境色）を加算 ──
-        # MMDは「テクスチャ×diffuse + ambient」で色を合成する。
-        # ambient が黒(0,0,0)でなければ、加算ノードを挟んで色を持ち上げる。
-        # これにより黒い眉などが ambient 分だけ明るく（金色っぽく）なる。
-        if ambient and max(ambient) > 0.001 and ambient_strength > 0.001:
-            add = tree.nodes.new(type="ShaderNodeMixRGB")
-            add.location = (60, 200)
-            add.blend_type = "ADD"
-            add.inputs[0].default_value = 1.0
-            ar = ambient[0] * ambient_strength
-            ag = ambient[1] * ambient_strength
-            ab = ambient[2] * ambient_strength
+        # ── MMD式の色合成: テクスチャ × clamp(diffuse + ambient) ──
+        # 旧版の「ambientを後から加算」は明るい部分を白飛びさせ、
+        # 加算を切ると diffuse黒＋ambient色 のマテリアルが真っ黒になる
+        # 板挟みだった。乗算係数方式なら両方を同時に解決できる。
+        # 【v2.6.6で修正】ただしスフィア専用フォールバック時は、そもそも
+        # diffuse/ambientが真っ黒だからこそフォールバックに入っている。
+        # ここでtintを乗算すると、せっかく拾ったスフィアの色を再び黒く
+        # 潰してしまうため、フォールバック時はtintを適用しない。
+        tr = (1.0 - s) + mmd_tint[0] * s
+        tg = (1.0 - s) + mmd_tint[1] * s
+        tb = (1.0 - s) + mmd_tint[2] * s
+        needs_tint = (
+            not sphere_fallback_active
+            and (
+                abs(tr - 1.0) > 0.003
+                or abs(tg - 1.0) > 0.003
+                or abs(tb - 1.0) > 0.003
+            )
+        )
+        if needs_tint:
+            tint_mix = tree.nodes.new(type="ShaderNodeMixRGB")
+            tint_mix.location = (60, 200)
+            tint_mix.blend_type = "MULTIPLY"
+            tint_mix.inputs[0].default_value = 1.0
             try:
-                add.inputs[2].default_value = (ar, ag, ab, 1.0)
+                tint_mix.inputs[2].default_value = (tr, tg, tb, 1.0)
             except Exception:
-                add.inputs[2].default_value = (ar, ag, ab)
-            _link_if_possible(tree, color_source, add.inputs[1])
-            _link_if_possible(tree, add.outputs.get("Color"), base_color_socket)
+                tint_mix.inputs[2].default_value = (tr, tg, tb)
+            _link_if_possible(tree, color_source, tint_mix.inputs[1])
+            _link_if_possible(
+                tree, tint_mix.outputs.get("Color"), base_color_socket
+            )
         else:
             _link_if_possible(tree, color_source, base_color_socket)
 
-        # テクスチャのアルファは Alpha ソケットにリンクしない。
-        # 半透明（alpha<1.0）の制御は、後段で設定する Alpha ソケットの
-        # default_value（マテリアルのalpha値）だけで行う。
-        # テクスチャのアルファを繋ぐと、肌テクスチャの透明部分などで
-        # 顔・肌全体が透ける誤動作になるため。
+        # テクスチャのアルファ接続:
+        # texture_alpha_applies が True の場合のみ、テクスチャのアルファを
+        # Alpha ソケットに接続し、半透明の重ね描き(眉毛など)を再現する。
+        # それ以外は default_value（マテリアルのalpha値）だけで制御し、
+        # 肌テクスチャなどが誤って透けることを防ぐ。
+        if texture_alpha_applies:
+            tex_alpha = tex.outputs.get("Alpha")
+            _link_if_possible(tree, tex_alpha, alpha_socket)
 
 
 # ============================================================
@@ -726,15 +807,24 @@ class MMD_OT_ConvertMaterials(Operator):
     )
 
     ambient_strength: FloatProperty(
-        name="環境色（明るさ）の強さ",
-        description="MMDのambientをBase Colorに加算する強さ。"
-                    "上げると眉などが明るく（金色寄り）になるが、上げすぎると全体が白っぽくなる。"
-                    "通常は0（素直なテクスチャ色）。眉などをMMD寄りにしたい場合のみ上げる",
-        default=0.0,
+        name="MMD色再現の強さ",
+        description="MMD式の色合成「テクスチャ×(diffuse+ambient)」の適用度。"
+                    "1.0でMMDの見た目に忠実（真っ黒と白飛びの両方を解消）。"
+                    "0にすると従来動作（テクスチャ素通し・単色はdiffuseのみ）",
+        default=1.0,
         min=0.0,
         max=1.0,
         step=1,        # スライダーのステップ（0.01単位）
         precision=2,
+    )
+
+    use_texture_alpha: BoolProperty(
+        name="テクスチャの透過を再現",
+        description="テクスチャに実際の透明部分がある場合（眉毛など、地肌の上に"
+                    "半透明で重ね描きされたテクスチャ）、そのアルファをAlphaソケットに"
+                    "反映して透過を再現する。通常はオン推奨。"
+                    "肌などの不透明な画像には影響しない",
+        default=True,
     )
 
     def execute(self, context):
@@ -810,6 +900,7 @@ class MMD_OT_ConvertMaterials(Operator):
                 force_double_sided=self.force_double_sided,
                 ambient=ambient,
                 ambient_strength=self.ambient_strength,
+                use_texture_alpha=self.use_texture_alpha,
             )
 
             converted += 1
@@ -1018,7 +1109,7 @@ class MMD_OT_ExportGLTF(Operator, ExportHelper):
         if self.convert_materials_before_export:
             by_basename = _build_image_cache()
             search_dirs = _get_model_search_dirs()
-            _run_convert_materials(by_basename, search_dirs)
+            _run_convert_materials(by_basename, search_dirs, use_texture_alpha=True)
 
         hidden_states = _hide_mmd_internal_objects()
         muted_states = _mute_sdef_shape_keys()
@@ -1180,7 +1271,7 @@ class MMD_OT_ExportFBX(Operator, ExportHelper):
         if self.convert_materials_before_export:
             by_basename = _build_image_cache()
             search_dirs = _get_model_search_dirs()
-            _run_convert_materials(by_basename, search_dirs)
+            _run_convert_materials(by_basename, search_dirs, use_texture_alpha=True)
 
         # glTFと共通の前処理（内部オブジェクト非表示・SDEFシェイプキーのミュート）
         hidden_states = _hide_mmd_internal_objects()
@@ -1222,7 +1313,8 @@ class MMD_OT_ExportFBX(Operator, ExportHelper):
 
 def _run_convert_materials(by_basename, search_dirs, sphere_mode="NONE",
                            force_double_sided=False,
-                           ambient_strength=AMBIENT_STRENGTH):
+                           ambient_strength=AMBIENT_STRENGTH,
+                           use_texture_alpha=True):
     """
     bpy.ops を経由せずマテリアル変換を直接実行する内部関数。
     エクスポートダイアログのコンテキスト問題を回避するために使用。
@@ -1346,13 +1438,13 @@ classes = [
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    print("MMD Exporter v2.6.1: 有効化されました")
+    print("MMD Exporter v2.6.6: 有効化されました")
 
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    print("MMD Exporter v2.6.1: 無効化されました")
+    print("MMD Exporter v2.6.6: 無効化されました")
 
 
 if __name__ == "__main__":
